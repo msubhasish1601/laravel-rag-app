@@ -149,6 +149,7 @@
     </div>
 
     <!-- Client-side Script -->
+
     <script>
         const chatWindow = document.getElementById('chat-window');
         const questionInput = document.getElementById('question-input');
@@ -203,9 +204,18 @@
             drawer.classList.add('translate-x-full');
         }
 
-        // --- Smooth Typewriter Engine ---
-        function typeWriterEffect(element, text, speed = 15, onComplete = null) {
+       // --- Visibility-Aware Typewriter Engine ---
+        function typeWriterEffect(element, text, speed = 12, onComplete = null) {
+            // 1. If tab is already in the background when data arrives, render instantly
+            if (document.hidden) {
+                element.textContent = text;
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+                if (onComplete) onComplete();
+                return;
+            }
+
             let i = 0;
+            let timer = null;
             element.textContent = '';
             
             // Add animated cursor
@@ -213,18 +223,53 @@
             cursor.className = 'inline-block w-2 h-4 bg-blue-600 ml-0.5 animate-pulse align-middle';
             element.parentNode.appendChild(cursor);
 
+            // Fast-forward handler if user switches tabs mid-typing
+            function completeInstantly() {
+                if (timer) clearTimeout(timer);
+                document.removeEventListener('visibilitychange', onVisibilityChange);
+                element.textContent = text;
+                cursor.remove();
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+                if (onComplete) onComplete();
+            }
+
+            function onVisibilityChange() {
+                if (document.hidden) {
+                    completeInstantly();
+                }
+            }
+
+            document.addEventListener('visibilitychange', onVisibilityChange);
+
             function type() {
                 if (i < text.length) {
                     element.textContent += text.charAt(i);
                     i++;
                     chatWindow.scrollTop = chatWindow.scrollHeight;
-                    setTimeout(type, speed);
+                    timer = setTimeout(type, speed);
                 } else {
+                    document.removeEventListener('visibilitychange', onVisibilityChange);
                     cursor.remove();
                     if (onComplete) onComplete();
                 }
             }
+            
             type();
+        }
+
+        function lockInputs() {
+            sendBtn.disabled = true;
+            questionInput.disabled = true;
+            modelSelect.disabled = true;
+            sendBtn.classList.add('opacity-50', 'cursor-not-allowed');
+        }
+
+        function unlockInputs() {
+            sendBtn.disabled = false;
+            questionInput.disabled = false;
+            modelSelect.disabled = false;
+            sendBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            questionInput.focus();
         }
 
         async function sendMessage() {
@@ -236,11 +281,8 @@
 
             const selectedModel = modelSelect.value;
 
-            // Lock inputs
-            sendBtn.disabled = true;
-            questionInput.disabled = true;
-            modelSelect.disabled = true;
-            sendBtn.classList.add('opacity-50', 'cursor-not-allowed');
+            // Lock inputs immediately to prevent concurrent requests
+            lockInputs();
 
             // 1. Render User Message
             chatWindow.innerHTML += `
@@ -315,27 +357,25 @@
                     chunkStore[responseKey] = data.raw_chunks;
                 }
 
-                // 5. Start Typewriter Effect in the same bubble
+                // 5. Start Typewriter Effect and unlock inputs ONLY when fully complete
                 typeWriterEffect(textTarget, data.answer || 'No response generated.', 12, () => {
-                    // Show footer only after typing is complete
                     if (data.source) {
                         sourceTarget.innerHTML = `📎 ${escapeHtml(data.source)}`;
                         footerTarget.classList.remove('hidden');
                     }
                     chatWindow.scrollTop = chatWindow.scrollHeight;
+                    
+                    // UNLOCK INPUTS HERE (After typing animation finishes)
+                    unlockInputs();
                 });
 
             } catch (error) {
                 if (loaderElement) loaderElement.remove();
                 textTarget.textContent = 'An error occurred while communicating with the server.';
                 console.error(error);
-            } finally {
-                // Unlock inputs
-                sendBtn.disabled = false;
-                questionInput.disabled = false;
-                modelSelect.disabled = false;
-                sendBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-                questionInput.focus();
+                
+                // Unlock inputs on error so the user isn't permanently locked
+                unlockInputs();
             }
         }
 

@@ -76,16 +76,31 @@ class RagDocumentController extends Controller
         $aiModel  = $request->input('ai_model');
         $category = $request->input('category', 'All');
 
-        // 1. Save user question
+        // 1. PRUNED SLIDING WINDOW (Conversational Short-Term Memory)
+        // Pull the last 4 messages (2 conversation turns) prior to saving the new message
+        $recentHistory = RagMessage::orderBy('id', 'desc')->take(4)->get()->reverse();
+
+        $historyText = "";
+        if ($recentHistory->isNotEmpty()) {
+            $historyText = "--- RECENT CONVERSATION HISTORY ---\n";
+            foreach ($recentHistory as $msg) {
+                $role  = $msg->role === 'user' ? 'User' : 'AI';
+                // Truncate assistant responses to 250 characters to preserve token budget
+                $content      = \Illuminate\Support\Str::limit($msg->content, 250, '...');
+                $historyText .= "{$role}: {$content}\n";
+            }
+            $historyText .= "-----------------------------------\n\n";
+        }
+
+        // 2. Save user question
         RagMessage::create(['role' => 'user', 'content' => $question]);
 
-        // 2. Retrieve vector context using metadata filter
+        // 3. Retrieve context using Hybrid Search & Metadata Filter
         $retrieval = $this->ragService->getContextForQuery($question, $category);
         $context   = $retrieval['context'];
         $rawChunks = $retrieval['chunks'] ?? [];
 
-        // 3. Context-Proportional Token Sizing (Industry Standard)
-        // Automatically scales token ceilings based on the volume of retrieved text
+        // 4. Context-Proportional Token Sizing
         $contextLength = strlen($context);
         if ($contextLength > 2000) {
             $maxTokens = 2048; // Comprehensive output (e.g., full recipes, guides)
@@ -95,11 +110,22 @@ class RagDocumentController extends Controller
             $maxTokens = 512; // Concise definition/answer
         }
 
-        $systemPrompt = "You are a precise document-grounded retrieval assistant. Answer the user's question using ONLY the provided context. If the answer cannot be found in the context, state clearly that the uploaded documents do not contain enough information to answer.";
-        $prompt       = "Context:\n{$context}\n\nQuestion: {$question}";
+        // 5. INTENT-AWARE SYSTEM PROMPT (Task-Specific Extraction)
+        $systemPrompt = "You are a precise, document-grounded AI assistant. Your primary directive is to answer the user's EXACT question using ONLY the provided context and recent conversation history.
+
+        Follow these strict formatting rules based on what the user asks:
+        1. Definition Queries (e.g., 'What is X?'): Provide a concise summary explaining what the item is. Do NOT include full recipes, steps, or exhaustive ingredient lists unless explicitly requested.
+        2. Ingredient/Component Queries (e.g., 'What are the ingredients in X?', 'What are its ingredients?'): Output ONLY the bulleted list of ingredients/components. Do NOT include preparation steps or cooking directions.
+        3. Procedural Queries (e.g., 'How to prepare X', 'Recipe for X', 'Steps for X'): Provide the COMPLETE, exhaustive step-by-step instructions and ingredients from the context without summarizing or skipping steps.
+
+        Use the recent conversation history strictly to resolve pronouns (e.g., 'it', 'they', 'this recipe') or references to prior topics. Do not volunteer extra unrequested sections. If the answer cannot be found in the context, state clearly that the uploaded documents do not contain enough information to answer.";
+
+        // Assemble final prompt
+        $prompt = "{$historyText}Context:\n{$context}\n\nCurrent Question: {$question}";
 
         $answer = '';
 
+        // 6. Model Execution
         if ($aiModel === 'gemini') {
             $apiKey   = env('GEMINI_API_KEY');
             $response = Http::timeout(30)
@@ -118,7 +144,7 @@ class RagDocumentController extends Controller
                 ? ($response->json('candidates.0.content.parts.0.text') ?? 'No response generated.')
                 : ('Gemini API Error: ' . $response->json('error.message', $response->body()));
         } else {
-            // Ollama Local with Context-Proportional Options
+            // Ollama Local
             $response = Http::timeout(0)->post('http://localhost:11434/api/generate', [
                 'model'  => 'phi3:mini',
                 'prompt' => "{$systemPrompt}\n\n{$prompt}",
@@ -130,13 +156,10 @@ class RagDocumentController extends Controller
             $answer = $response->json('response') ?? 'Unable to generate response from Ollama.';
         }
 
-        // 4. Post-Generation Source Filtering & Refusal Check
-        $activeSources = [];
-
-        // Detect if the AI generated a standard "not found" refusal message
+        // 7. Post-Generation Source Filtering & Refusal Check
+        $activeSources     = [];
         $isRefusalResponse = preg_match('/(do not contain|cannot be found|not enough information|does not contain|no information)/i', $answer);
 
-        // Only look for sources if the model actually found an answer in the text
         if (! $isRefusalResponse) {
             foreach ($rawChunks as $chunk) {
                 $docTitle = $chunk['document'];
@@ -155,7 +178,7 @@ class RagDocumentController extends Controller
         $filteredSources = implode(', ', $activeSources);
         $sourceInfo      = ! empty($filteredSources) ? "Source(s): {$filteredSources}" : null;
 
-        // 5. Save AI Message to DB
+        // 8. Save Assistant Message to DB
         RagMessage::create([
             'role'        => 'assistant',
             'content'     => $answer,
@@ -169,6 +192,7 @@ class RagDocumentController extends Controller
             'raw_chunks' => $rawChunks,
         ]);
     }
+
     // Clear chat history
     public function clearChat()
     {

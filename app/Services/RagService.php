@@ -3,6 +3,7 @@ namespace App\Services;
 
 use App\Models\DocumentChunk;
 use App\Models\RagDocument;
+use DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Pgvector\Laravel\Distance;
@@ -54,7 +55,9 @@ class RagService
                 'chunk_index'     => $index,
                 'content'         => $chunkText,
                 'embedding'       => $embeddingArray, // The pgvector cast handles this array automatically!
+                'search_vector'   => DB::raw("to_tsvector('english', " . DB::getPdo()->quote($chunkText) . ")"),
             ]);
+
         }
 
         return $document;
@@ -73,7 +76,8 @@ class RagService
 
         return $chunks;
     }
-    public function getContextForQuery(string $query): array
+
+    public function getContextForQueryOld(string $query): array
     {
         $queryEmbedding = $this->generateEmbedding($query);
         $matches        = collect();
@@ -103,45 +107,125 @@ class RagService
         ];
     }
 
-    // public function getContextForQuery(string $query): array
+    // public function getContextForQuery(string $query, ?string $category = null): array
     // {
-    //     // 1. Remove all punctuation (e.g., "?" or ".") so "oops?" becomes "oops"
-    //     $cleanQuery = preg_replace('/[^\w\s]/', '', strtolower($query));
+    //     $queryEmbedding = $this->generateEmbedding($query);
+    //     $matches        = collect();
 
-    //     // 2. Expanded stop words to ignore conversational filler words
-    //     $stopWords = [
-    //         'what', 'is', 'in', 'the', 'a', 'an', 'and', 'to', 'of', 'how',
-    //         'does', 'do', 'can', 'you', 'give', 'me', 'an', 'example', 'for', 'python', 'about',
-    //     ];
+    //     if ($queryEmbedding) {
+    //         // 1. DENSE SEARCH (Vector Cosine Similarity)
+    //         $vectorQuery = DocumentChunk::with('document')
+    //             ->whereNotNull('embedding');
 
-    //     $words = array_filter(explode(' ', $cleanQuery), function ($word) use ($stopWords) {
-    //         return mb_strlen($word) > 1 && ! in_array($word, $stopWords);
-    //     });
+    //         if ($category && $category !== 'All') {
+    //             $vectorQuery->whereHas('document', function ($q) use ($category) {
+    //                 $q->where('category', $category);
+    //             });
+    //         }
 
-    //     $matches = collect();
+    //         // Get top vector matches
+    //         $vectorMatches = (clone $vectorQuery)
+    //             ->nearestNeighbors('embedding', $queryEmbedding, Distance::Cosine)
+    //             ->limit(6)
+    //             ->get();
 
-    //     if (! empty($words)) {
-    //         $queryBuilder = DocumentChunk::with('document');
-    //         $queryBuilder->where(function ($q) use ($words) {
-    //             foreach ($words as $word) {
-    //                 $q->orWhere('content', 'LIKE', '%' . $word . '%');
-    //             }
-    //         });
-    //         // Grab top 5 matching chunks to ensure we get a wide context window
-    //         $matches = $queryBuilder->limit(5)->get();
-    //     }
+    //         // 2. SPARSE SEARCH (PostgreSQL Full-Text Keyword Search)
+    //         $keywordQuery = DocumentChunk::with('document')
+    //             ->whereNotNull('search_vector');
 
-    //     // Fallback to latest chunks if no keywords matched
-    //     if ($matches->isEmpty()) {
-    //         $matches = DocumentChunk::with('document')->latest()->limit(3)->get();
+    //         if ($category && $category !== 'All') {
+    //             $keywordQuery->whereHas('document', function ($q) use ($category) {
+    //                 $q->where('category', $category);
+    //             });
+    //         }
+
+    //                                                     // Clean query for postgres text search safely
+    //         $safeKeywords   = pg_escape_string($query); // or use a basic string cleanup
+    //         $keywordMatches = $keywordQuery
+    //             ->whereRaw("search_vector @@ plainto_tsquery('english', ?)", [$query])
+    //             ->limit(6)
+    //             ->get();
+
+    //         // 3. MERGE & DE-DUPLICATE (Hybrid Fusion)
+    //         // Combine vector and keyword results, prioritizing chunks found by BOTH methods
+    //         $matches = $vectorMatches->concat($keywordMatches)->unique('id')->take(8);
     //     }
 
     //     $contextText = $matches->pluck('content')->implode("\n\n---\n\n");
-    //     $sources     = $matches->pluck('document.title')->unique()->values()->all();
+    //     $sources     = $matches->pluck('document.title')->filter()->unique()->values()->all();
 
     //     return [
     //         'context' => $contextText,
     //         'sources' => $sources,
+    //         'chunks'  => $matches->map(function ($chunk) {
+    //             return [
+    //                 'id'          => $chunk->id,
+    //                 'document'    => $chunk->document->title ?? 'Unknown',
+    //                 'chunk_index' => $chunk->chunk_index,
+    //                 'content'     => $chunk->content,
+    //             ];
+    //         })->toArray(),
     //     ];
     // }
+
+    public function getContextForQuery(string $query, ?string $category = null): array
+    {
+        $queryEmbedding = $this->generateEmbedding($query);
+        $matches        = collect();
+
+        if ($queryEmbedding) {
+            // 1. DENSE SEARCH (Vector Cosine Similarity - PRIMARY AUTHORITY)
+            $vectorQuery = DocumentChunk::with('document')
+                ->whereNotNull('embedding');
+
+            if ($category && $category !== 'All') {
+                $vectorQuery->whereHas('document', function ($q) use ($category) {
+                    $q->where('category', $category);
+                });
+            }
+
+            // Give vector search a higher allocation (e.g., top 6)
+            $vectorMatches = (clone $vectorQuery)
+                ->nearestNeighbors('embedding', $queryEmbedding, Distance::Cosine)
+                ->limit(6)
+                ->get();
+
+            // 2. SPARSE SEARCH (PostgreSQL Full-Text Keyword Search - SECONDARY BOOST)
+            $keywordQuery = DocumentChunk::with('document')
+                ->whereNotNull('search_vector');
+
+            if ($category && $category !== 'All') {
+                $keywordQuery->whereHas('document', function ($q) use ($category) {
+                    $q->where('category', $category);
+                });
+            }
+
+            // Keep keyword limit smaller (e.g., top 2) so it doesn't flood the context with headers
+            $keywordMatches = $keywordQuery
+                ->whereRaw("search_vector @@ plainto_tsquery('english', ?)", [$query])
+                ->limit(2)
+                ->get();
+
+            // 3. PRIORITIZED FUSION
+            // Put vector matches FIRST so semantic context anchors the prompt,
+            // then append unique keyword matches to catch exact terms without displacing steps.
+            $matches = $vectorMatches->concat($keywordMatches)->unique('id')->take(6);
+        }
+
+        $contextText = $matches->pluck('content')->implode("\n\n---\n\n");
+        $sources     = $matches->pluck('document.title')->filter()->unique()->values()->all();
+
+        return [
+            'context' => $contextText,
+            'sources' => $sources,
+            'chunks'  => $matches->map(function ($chunk) {
+                return [
+                    'id'          => $chunk->id,
+                    'document'    => $chunk->document->title ?? 'Unknown',
+                    'chunk_index' => $chunk->chunk_index,
+                    'content'     => $chunk->content,
+                ];
+            })->toArray(),
+        ];
+    }
 }

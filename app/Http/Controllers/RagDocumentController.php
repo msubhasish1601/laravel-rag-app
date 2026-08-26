@@ -31,9 +31,14 @@ class RagDocumentController extends Controller
             'category' => 'required|string|max:50',
         ]);
 
-        $file      = $request->file('document');
-        $path      = $file->store('documents', 'public');
-        $extension = $file->getClientOriginalExtension();
+        // $file      = $request->file('document');
+        // $path      = $file->store('documents', 'public');
+        // $extension = $file->getClientOriginalExtension();
+
+        $file         = $request->file('document');
+        $extension    = $file->getClientOriginalExtension();
+        $originalName = $file->getClientOriginalName();
+        $tempPath     = $file->getRealPath();
 
         $rawText = '';
 
@@ -56,9 +61,99 @@ class RagDocumentController extends Controller
             return back()->withErrors(['document' => 'Could not extract text from this file.']);
         }
 
-        $this->ragService->processDocument($file->getClientOriginalName(), $request->input('category'), $path, $rawText);
+        // $this->ragService->processDocument($file->getClientOriginalName(), $request->input('category'), $path, $rawText);
+        // 2. CONFIGURE & UPLOAD TO CLOUDINARY
+        \Cloudinary::config_from_url(env('CLOUDINARY_URL'));
+        $cloudinaryUpload = \Cloudinary\Uploader::upload($tempPath, [
+            "folder"        => "laravel_rag",
+            "resource_type" => "auto", // Crucial: Prevents Cloudinary from altering the PDF
+        ]);
 
+        $secureCloudUrl = $cloudinaryUpload['secure_url'];
+
+        // 3. INDEX DOCUMENT WITH CLOUDINARY URL
+        $this->ragService->processDocument($originalName, $request->input('category'), $secureCloudUrl, $rawText);
         return back()->with('success', 'Document uploaded and indexed successfully!');
+    }
+
+    // Handle Web URL & Remote PDF ingestion
+    public function storeUrl(Request $request)
+    {
+        $request->validate([
+            'url'      => 'required|url|max:2048',
+            'category' => 'required|string|max:50',
+        ]);
+
+        $url = $request->input('url');
+
+        try {
+                                                                             // 1. Add a standard User-Agent header to bypass basic bot-blockers like Cloudflare
+            $response = \Illuminate\Support\Facades\Http::withoutVerifying() // <--- Add this to bypass local SSL issues
+                ->withHeaders([
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ])
+                ->timeout(15)
+                ->get($url);
+
+            if (! $response->successful()) {
+                return back()->withErrors(['url' => 'Failed to reach the URL. It might be blocking scrapers.']);
+            }
+
+            $contentType = $response->header('Content-Type');
+            $rawText     = '';
+            $pageTitle   = $url;
+
+            // 2. CHECK: Is this a PDF file?
+            if (str_ends_with(strtolower(parse_url($url, PHP_URL_PATH)), '.pdf') || str_contains(strtolower($contentType), 'application/pdf')) {
+                // Handle as remote PDF
+                try {
+                    $parser = new \Smalot\PdfParser\Parser();
+                    // parseContent reads directly from the downloaded memory string
+                    $pdf   = $parser->parseContent($response->body());
+                    $pages = $pdf->getPages();
+                    foreach ($pages as $page) {
+                        $rawText .= $page->getText() . "\n";
+                    }
+                    // Use the filename from the URL as the title
+                    $pageTitle = basename(parse_url($url, PHP_URL_PATH));
+                } catch (\Exception $e) {
+                    return back()->withErrors(['url' => 'Failed to parse remote PDF: ' . $e->getMessage()]);
+                }
+            }
+            // 3. Otherwise, handle as standard HTML Webpage
+            else {
+                $html = $response->body();
+                $dom  = new \DOMDocument();
+                @$dom->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
+
+                $titles    = $dom->getElementsByTagName('title');
+                $pageTitle = $titles->length > 0 ? $titles->item(0)->textContent : $url;
+
+                $tagsToScrape = ['h1', 'h2', 'h3', 'p', 'li'];
+                foreach ($tagsToScrape as $tag) {
+                    $elements = $dom->getElementsByTagName($tag);
+                    foreach ($elements as $element) {
+                        $rawText .= $element->textContent . "\n\n";
+                    }
+                }
+            }
+
+            // 4. Clean up whitespace
+            $rawText = preg_replace("/\n\s+/", "\n\n", trim($rawText));
+
+            if (empty($rawText) || strlen($rawText) < 50) {
+                return back()->withErrors(['url' => 'Could not extract enough readable text from this URL.']);
+            }
+
+            // 5. Save to database using the original URL & Index the chunks
+            $safeTitle = \Illuminate\Support\Str::limit(trim($pageTitle), 250);
+            $this->ragService->processDocument($safeTitle, $request->input('category'), $url, $rawText);
+
+            return back()->with('success', 'URL content scraped and indexed successfully!');
+
+        } catch (\Exception $e) {
+            return back()->withErrors(['url' => 'Error processing URL: ' . $e->getMessage()]);
+        }
     }
 
     // Handle chat queries via Ollama
@@ -201,10 +296,54 @@ class RagDocumentController extends Controller
     }
 
     // Delete a specific document
+    // public function destroy($id)
+    // {
+    //     $document = RagDocument::findOrFail($id);
+    //     $document->delete();
+    //     return back()->with('success', 'Document deleted successfully.');
+    // }
+
     public function destroy($id)
     {
         $document = RagDocument::findOrFail($id);
+
+        // 1. Delete from Cloudinary if it is a cloud asset
+        if ($document->file_path && str_contains($document->file_path, 'cloudinary.com')) {
+            try {
+                \Cloudinary::config_from_url(env('CLOUDINARY_URL'));
+
+                // Extract full public ID with folder from URL:
+                // Example URL: https://res.cloudinary.com/dpm4zelrc/image/upload/v1724678123/laravel_rag/abc123xyz.pdf
+                $parsedUrl = parse_url($document->file_path, PHP_URL_PATH);
+
+                // Remove everything up to and including "/upload/" (and optional version "/v123456/")
+                $afterUpload = preg_replace('/^.*?\/upload\/(?:v\d+\/)?/', '', $parsedUrl);
+
+                // Remove file extension (e.g. "laravel_rag/abc123xyz.pdf" -> "laravel_rag/abc123xyz")
+                $publicId = preg_replace('/\.[^.]+$/', '', $afterUpload);
+
+                // Attempt deletion as 'image' (PDFs uploaded via auto are stored as image multi-page assets)
+                $res = \Cloudinary\Uploader::destroy($publicId, [
+                    'resource_type' => 'image',
+                    'invalidate'    => true,
+                ]);
+
+                // If not found in images, fallback to raw bucket
+                if (isset($res['result']) && $res['result'] === 'not found') {
+                    \Cloudinary\Uploader::destroy($afterUpload, [
+                        'resource_type' => 'raw',
+                        'invalidate'    => true,
+                    ]);
+                }
+            } catch (\Exception $e) {
+                // Log exception without breaking database cleanup
+                \Log::error('Cloudinary deletion failed: ' . $e->getMessage());
+            }
+        }
+
+        // 2. Delete from PostgreSQL (chunks cascade delete automatically)
         $document->delete();
-        return back()->with('success', 'Document deleted successfully.');
+
+        return back()->with('success', 'Document and cloud assets deleted successfully.');
     }
 }

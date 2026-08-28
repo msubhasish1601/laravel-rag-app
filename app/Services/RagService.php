@@ -77,97 +77,6 @@ class RagService
         return $chunks;
     }
 
-    public function getContextForQueryOld(string $query): array
-    {
-        $queryEmbedding = $this->generateEmbedding($query);
-        $matches        = collect();
-
-        if ($queryEmbedding) {
-            $matches = DocumentChunk::with('document')
-                ->whereNotNull('embedding')
-                ->nearestNeighbors('embedding', $queryEmbedding, Distance::Cosine)
-                ->limit(4)
-                ->get();
-        }
-
-        $contextText = $matches->pluck('content')->implode("\n\n---\n\n");
-        $sources     = $matches->pluck('document.title')->filter()->unique()->values()->all();
-
-        return [
-            'context' => $contextText,
-            'sources' => $sources,
-            'chunks'  => $matches->map(function ($chunk) {
-                return [
-                    'id'          => $chunk->id,
-                    'document'    => $chunk->document->title ?? 'Unknown',
-                    'chunk_index' => $chunk->chunk_index,
-                    'content'     => $chunk->content,
-                ];
-            })->toArray(),
-        ];
-    }
-
-    // public function getContextForQuery(string $query, ?string $category = null): array
-    // {
-    //     $queryEmbedding = $this->generateEmbedding($query);
-    //     $matches        = collect();
-
-    //     if ($queryEmbedding) {
-    //         // 1. DENSE SEARCH (Vector Cosine Similarity)
-    //         $vectorQuery = DocumentChunk::with('document')
-    //             ->whereNotNull('embedding');
-
-    //         if ($category && $category !== 'All') {
-    //             $vectorQuery->whereHas('document', function ($q) use ($category) {
-    //                 $q->where('category', $category);
-    //             });
-    //         }
-
-    //         // Get top vector matches
-    //         $vectorMatches = (clone $vectorQuery)
-    //             ->nearestNeighbors('embedding', $queryEmbedding, Distance::Cosine)
-    //             ->limit(6)
-    //             ->get();
-
-    //         // 2. SPARSE SEARCH (PostgreSQL Full-Text Keyword Search)
-    //         $keywordQuery = DocumentChunk::with('document')
-    //             ->whereNotNull('search_vector');
-
-    //         if ($category && $category !== 'All') {
-    //             $keywordQuery->whereHas('document', function ($q) use ($category) {
-    //                 $q->where('category', $category);
-    //             });
-    //         }
-
-    //                                                     // Clean query for postgres text search safely
-    //         $safeKeywords   = pg_escape_string($query); // or use a basic string cleanup
-    //         $keywordMatches = $keywordQuery
-    //             ->whereRaw("search_vector @@ plainto_tsquery('english', ?)", [$query])
-    //             ->limit(6)
-    //             ->get();
-
-    //         // 3. MERGE & DE-DUPLICATE (Hybrid Fusion)
-    //         // Combine vector and keyword results, prioritizing chunks found by BOTH methods
-    //         $matches = $vectorMatches->concat($keywordMatches)->unique('id')->take(8);
-    //     }
-
-    //     $contextText = $matches->pluck('content')->implode("\n\n---\n\n");
-    //     $sources     = $matches->pluck('document.title')->filter()->unique()->values()->all();
-
-    //     return [
-    //         'context' => $contextText,
-    //         'sources' => $sources,
-    //         'chunks'  => $matches->map(function ($chunk) {
-    //             return [
-    //                 'id'          => $chunk->id,
-    //                 'document'    => $chunk->document->title ?? 'Unknown',
-    //                 'chunk_index' => $chunk->chunk_index,
-    //                 'content'     => $chunk->content,
-    //             ];
-    //         })->toArray(),
-    //     ];
-    // }
-
     public function getContextForQuery(string $query, ?string $category = null): array
     {
         $queryEmbedding = $this->generateEmbedding($query);
@@ -227,5 +136,36 @@ class RagService
                 ];
             })->toArray(),
         ];
+    }
+
+    /**
+     * Processes text for a document that ALREADY exists in the database.
+     */
+    public function chunkExistingDocument(\App\Models\RagDocument $document, string $rawText)
+    {
+        // 1. Chunk the text
+        $chunks = explode("\n\n", $rawText);
+        $chunks = array_filter(array_map('trim', $chunks));
+
+        $chunkIndex = 0; // <--- 1. Initialize a counter here
+
+        foreach ($chunks as $chunkText) {
+            if (empty($chunkText) || strlen($chunkText) < 10) {
+                continue;
+            }
+
+            // 2. Generate Vector Embedding
+            $embedding = $this->generateEmbedding($chunkText);
+
+            // 3. Save the chunk
+            \App\Models\DocumentChunk::create([
+                'rag_document_id' => $document->id,
+                'chunk_index'     => $chunkIndex, // <--- 2. Add this field!
+                'content'         => $chunkText,
+                'embedding'       => $embedding,
+            ]);
+
+            $chunkIndex++; // <--- 3. Increment the counter for the next chunk
+        }
     }
 }

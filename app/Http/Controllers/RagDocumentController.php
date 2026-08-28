@@ -1,6 +1,7 @@
 <?php
 namespace App\Http\Controllers;
 
+use App\Jobs\ProcessRagDocument;
 use App\Models\RagDocument;
 use App\Models\RagMessage;
 use App\Services\RagService;
@@ -72,8 +73,21 @@ class RagDocumentController extends Controller
         $secureCloudUrl = $cloudinaryUpload['secure_url'];
 
         // 3. INDEX DOCUMENT WITH CLOUDINARY URL
-        $this->ragService->processDocument($originalName, $request->input('category'), $secureCloudUrl, $rawText);
-        return back()->with('success', 'Document uploaded and indexed successfully!');
+        // $this->ragService->processDocument($originalName, $request->input('category'), $secureCloudUrl, $rawText);
+        // return back()->with('success', 'Document uploaded and indexed successfully!');
+
+        // 3. CREATE DATABASE RECORD SYNCHRONOUSLY AS 'PROCESSING'
+        $document = RagDocument::create([
+            'title'     => $originalName,
+            'category'  => $request->input('category'),
+            'file_path' => $secureCloudUrl,
+            'status'    => 'processing', // Explicitly set status
+        ]);
+
+        // 4. DISPATCH JOB WITH DOCUMENT ID
+        ProcessRagDocument::dispatch($document->id, $rawText);
+
+        return back()->with('success', 'Document queued! It is currently being indexed in the background.');
     }
 
     // Handle Web URL & Remote PDF ingestion
@@ -146,10 +160,30 @@ class RagDocumentController extends Controller
             }
 
             // 5. Save to database using the original URL & Index the chunks
-            $safeTitle = \Illuminate\Support\Str::limit(trim($pageTitle), 250);
-            $this->ragService->processDocument($safeTitle, $request->input('category'), $url, $rawText);
+            // $safeTitle = \Illuminate\Support\Str::limit(trim($pageTitle), 250);
+            // $this->ragService->processDocument($safeTitle, $request->input('category'), $url, $rawText);
 
-            return back()->with('success', 'URL content scraped and indexed successfully!');
+            // return back()->with('success', 'URL content scraped and indexed successfully!');
+
+            // 5. Create or Update the database record synchronously as 'processing'
+            $safeTitle = \Illuminate\Support\Str::limit(trim($pageTitle), 250);
+
+            $document = RagDocument::updateOrCreate(
+                ['file_path' => $url],
+                [
+                    'title'    => $safeTitle,
+                    'category' => $request->input('category'),
+                    'status'   => 'processing', // Explicitly set status
+                ]
+            );
+
+            // Wipe old chunks if this is an overwrite of an existing URL
+            $document->chunks()->delete();
+
+            // 6. Dispatch the background job passing the Document ID
+            ProcessRagDocument::dispatch($document->id, $rawText);
+
+            return back()->with('success', 'URL queued! It is currently being indexed in the background.');
 
         } catch (\Exception $e) {
             return back()->withErrors(['url' => 'Error processing URL: ' . $e->getMessage()]);

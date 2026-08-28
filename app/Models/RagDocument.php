@@ -5,7 +5,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class RagDocument extends Model
 {
-    protected $fillable = ['title', 'file_path', 'category'];
+    protected $fillable = ['title', 'file_path', 'category', 'status'];
 
     public function chunks()
     {

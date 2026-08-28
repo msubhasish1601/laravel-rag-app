@@ -1,5 +1,5 @@
 # Use the official PHP 8.2 Apache image
-FROM php:8.2-apache
+FROM php:8.3-apache
 
 # Install system dependencies and PostgreSQL drivers for pgvector
 RUN apt-get update && apt-get install -y \

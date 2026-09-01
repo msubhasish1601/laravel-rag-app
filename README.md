@@ -87,6 +87,7 @@ Unlike basic tutorial implementations that suffer from hallucinations, context f
 
 ---
 
+## 🛠️ Live URL (Gemini Only) : https://laravel-rag-app.onrender.com/
 ## 🛠️ Deep Dive: Production Challenges Solved
 
 ### 1. Hybrid Search (Dense + Sparse Retrieval Fusion)

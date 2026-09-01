@@ -1,7 +1,17 @@
 <?php
 
 use App\Http\Controllers\RagDocumentController;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Route;
+
+Route::get('/migrate-db-secret', function () {
+    try {
+        Artisan::call('migrate', ['--force' => true]);
+        return nl2br(Artisan::output());
+    } catch (\Exception $e) {
+        return "Error: " . $e->getMessage();
+    }
+});
 
 Route::get('/', [RagDocumentController::class, 'index'])->name('rag.index');
 Route::post('/documents', [RagDocumentController::class, 'store'])->name('documents.store');

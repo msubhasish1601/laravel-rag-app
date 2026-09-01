@@ -26,7 +26,8 @@ COPY . /var/www/html
 RUN composer install --no-dev --optimize-autoloader
 
 # Set correct folder permissions for Laravel
-RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
+RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache \
+    && chmod -R 777 /var/www/html/storage /var/www/html/bootstrap/cache
 
 # Copy the Supervisor configuration
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
